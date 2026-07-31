@@ -154,20 +154,74 @@ static void startI2CSlave()
 // ---- UART bridge (Serial1 on GPIO28/29) ----
 static String uartBuf;
 
+// Line protocol (badge -> firmware -> badge):
+//   status            -> ST <myShort> <nodeCount> <rx> <tx>
+//   nodes             -> ND <hex8> <short> <snr> ... NDE
+//   chans             -> CH <chIndex> <name> ... CHE
+//   msgs              -> MG <direct> <ch> <from> <text> ... MGE   (newest first)
+//   send c<idx> <txt> -> queue a channel broadcast; reply OK/ERR
+//   send n<hex8> <txt>-> queue a direct message to a node; reply OK/ERR
 static void handleBridgeLine(const String &line)
 {
+    BleepieBridge &b = g_bleepieBridge;
+
     if (line.startsWith("status")) {
-        Serial1.printf("MT %u %s\n", (unsigned)g_bleepieBridge.nodeCount, g_bleepieBridge.shortName);
-        Serial1.printf("LASTMSG %s\n", g_bleepieBridge.lastMsg);
-    } else if (line.startsWith("send ")) {
-        // Hand the text to core0 to transmit (consumed + cleared there).
-        if (!g_bleepieBridge.sendPending) {
-            String txt = line.substring(5);
-            strncpy(g_bleepieBridge.sendText, txt.c_str(), sizeof(g_bleepieBridge.sendText) - 1);
-            g_bleepieBridge.sendText[sizeof(g_bleepieBridge.sendText) - 1] = '\0';
-            g_bleepieBridge.sendPending = true;
+        Serial1.printf("ST %s %u %lu %lu\n", b.myName, (unsigned)b.nodeCount,
+                       (unsigned long)b.rxCount, (unsigned long)b.txCount);
+
+    } else if (line.startsWith("nodes")) {
+        uint8_t n = b.numNodes;
+        if (n > BLP_MAX_NODES)
+            n = BLP_MAX_NODES;
+        for (uint8_t i = 0; i < n; i++)
+            Serial1.printf("ND %08lx %s %d\n", (unsigned long)b.nodes[i].num,
+                           b.nodes[i].shortName, (int)b.nodes[i].snr);
+        Serial1.println("NDE");
+
+    } else if (line.startsWith("chans")) {
+        uint8_t n = b.numChans;
+        if (n > BLP_MAX_CHANS)
+            n = BLP_MAX_CHANS;
+        for (uint8_t i = 0; i < n; i++)
+            Serial1.printf("CH %u %s\n", b.chans[i].index, b.chans[i].name);
+        Serial1.println("CHE");
+
+    } else if (line.startsWith("msgs")) {
+        uint8_t n = b.numMsgs;
+        for (uint8_t k = 0; k < n; k++) { // newest first
+            int slot = (int)b.msgHead - 1 - (int)k;
+            while (slot < 0)
+                slot += BLP_MAX_MSGS;
+            BlpMsg &m = b.msgs[slot];
+            Serial1.printf("MG %u %u %s %s\n", m.direct, m.ch, m.from, m.text);
         }
-        Serial1.println("OK send");
+        Serial1.println("MGE");
+
+    } else if (line.startsWith("send ")) {
+        if (b.sendPending) {
+            Serial1.println("ERR busy");
+            return;
+        }
+        String rest = line.substring(5);
+        rest.trim();
+        int sp = rest.indexOf(' ');
+        if (sp > 1 && (rest[0] == 'c' || rest[0] == 'n')) {
+            String dest = rest.substring(0, sp);
+            String text = rest.substring(sp + 1);
+            if (dest[0] == 'c') {
+                b.sendIsNode = 0;
+                b.sendDest = (uint32_t)strtoul(dest.c_str() + 1, nullptr, 10);
+            } else {
+                b.sendIsNode = 1;
+                b.sendDest = (uint32_t)strtoul(dest.c_str() + 1, nullptr, 16);
+            }
+            strncpy(b.sendText, text.c_str(), sizeof(b.sendText) - 1);
+            b.sendText[sizeof(b.sendText) - 1] = '\0';
+            b.sendPending = true;
+            Serial1.println("OK send");
+        } else {
+            Serial1.println("ERR send");
+        }
     }
 }
 

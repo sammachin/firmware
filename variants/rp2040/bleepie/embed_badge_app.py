@@ -16,7 +16,26 @@ import os, sys, hashlib
 VARIANT_DIR = os.path.join(env.subst("$PROJECT_DIR"), "variants", "rp2040", "bleepie")  # noqa: F821
 APP_PY = os.path.join(VARIANT_DIR, "badge-app", "app.py")
 OUT_HEADER = os.path.join(VARIANT_DIR, "eeprom_image.h")
-HASH_FILE = os.path.join(env.subst("$BUILD_DIR"), "badge_app.md5")  # noqa: F821
+BUILD_DIR = env.subst("$BUILD_DIR")  # noqa: F821
+HASH_FILE = os.path.join(BUILD_DIR, "badge_app.md5")
+# The file that #includes eeprom_image.h. PlatformIO/SCons doesn't track the
+# generated header as a dependency, so on an app-only change the object file
+# would keep the stale embedded image. Force its recompile by touching the
+# source and dropping any cached object when we regenerate the header.
+EMBEDDER_SRC = os.path.join(env.subst("$PROJECT_DIR"),  # noqa: F821
+                            "src", "platform", "rp2xx0", "bleepie_hexpansion.cpp")
+EMBEDDER_OBJ = os.path.join(BUILD_DIR, "src", "platform", "rp2xx0", "bleepie_hexpansion.cpp.o")
+
+
+def force_embedder_rebuild():
+    try:
+        os.utime(EMBEDDER_SRC, None)
+    except OSError:
+        pass
+    try:
+        os.remove(EMBEDDER_OBJ)
+    except OSError:
+        pass
 
 BLOCK_SIZE = 512
 FS_OFFSET = 64
@@ -70,6 +89,8 @@ sh = saved_hash()
 if ah == sh and os.path.exists(OUT_HEADER):
     print("[embed_badge_app] app.py unchanged, skipping image generation")
 else:
+    # Header is being (re)generated → force the file that embeds it to recompile.
+    force_embedder_rebuild()
     if ah is None:
         print("[embed_badge_app] No badge-app/app.py found, generating empty header")
         write_empty_header()

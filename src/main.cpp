@@ -787,6 +787,15 @@ void setup()
 #endif
 #endif
 
+#if defined(BLEEPIE_MESHTASTIC) && defined(HAS_NEOPIXEL)
+    // Upstream only creates ambientLightingThread inside the !MESHTASTIC_EXCLUDE_I2C
+    // block above. This board excludes I2C but has a NeoPixel (HAS_RGB_LED), and
+    // ExternalNotificationModule::setExternalState() dereferences ambientLightingThread
+    // under HAS_RGB_LED — so create it here to avoid a null-pointer hang at boot.
+    if (!ambientLightingThread)
+        ambientLightingThread = new AmbientLightingThread(ScanI2C::DeviceType::NONE);
+#endif
+
 #ifdef HAS_DRV2605
 #if defined(PIN_DRV_EN)
     pinMode(PIN_DRV_EN, OUTPUT);

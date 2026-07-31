@@ -249,6 +249,13 @@ void setupModules()
 #if defined(HAS_HARDWARE_WATCHDOG)
     watchdogThread = new WatchdogThread();
 #endif
+#ifdef BLEEPIE_MESHTASTIC
+    // Bleepie: start the core0 side of the Tildagon badge bridge (publishes mesh
+    // status to core1 and sends badge-queued text messages).
+    extern void bleepieBridgeInit();
+    bleepieBridgeInit();
+#endif
+
     // NOTE! This module must be added LAST because it likes to check for replies from other modules and avoid sending extra
     // acks
     routingModule = new RoutingModule();

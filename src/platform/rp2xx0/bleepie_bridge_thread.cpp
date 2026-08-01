@@ -1,8 +1,9 @@
 // BleepieMeshtastic — core0 side of the Tildagon badge bridge.
 //
-// Publishes mesh status, the node list, the channel list, and recent received
-// messages into the shared BleepieBridge snapshot for core1's UART bridge, and
-// consumes badge-composed send requests (to a channel or a specific node).
+// Publishes mesh status, the node list, the channel list, and recent messages
+// (received + our own outgoing) into the shared BleepieBridge snapshot for
+// core1's UART bridge, and consumes badge-composed send requests (to a channel
+// or a specific node).
 //
 // Compiled only for the bleepie board. Registered by one guarded line in
 // src/modules/Modules.cpp (bleepieBridgeInit()).
@@ -24,7 +25,8 @@
 // hexpansion file is compiled out).
 struct BleepieBridge g_bleepieBridge = {};
 
-// Copy a Meshtastic 4-char short name (may be non-terminated char[5]) safely.
+static uint32_t g_msgSeq = 1; // monotonic message id
+
 static void copyShort(char *dst, const char *src)
 {
     strncpy(dst, src, BLP_SHORT - 1);
@@ -42,6 +44,26 @@ static void shortNameFor(uint32_t num, char *dst)
     }
 }
 
+// Append a message to the ring (called on core0 only: from the RX tap and from
+// the send-consumer, which never run concurrently under cooperative scheduling).
+static void pushMsg(uint32_t fromNum, uint32_t peer, const char *fromShort,
+                    uint8_t ch, uint8_t direct, const char *text)
+{
+    BleepieBridge &b = g_bleepieBridge;
+    BlpMsg &m = b.msgs[b.msgHead];
+    m.seq = g_msgSeq++;
+    m.fromNum = fromNum;
+    m.peer = peer;
+    copyShort(m.from, fromShort);
+    m.ch = ch;
+    m.direct = direct;
+    strncpy(m.text, text, BLP_TEXT - 1);
+    m.text[BLP_TEXT - 1] = '\0';
+    b.msgHead = (b.msgHead + 1) % BLP_MAX_MSGS;
+    if (b.numMsgs < BLP_MAX_MSGS)
+        b.numMsgs++;
+}
+
 // ---- Received-message tap (writes the ring on core0) ----
 class BleepieTextTap : public SinglePortModule
 {
@@ -55,21 +77,17 @@ class BleepieTextTap : public SinglePortModule
         if (n == 0)
             return ProcessMessage::CONTINUE;
 
-        BleepieBridge &b = g_bleepieBridge;
-        BlpMsg &m = b.msgs[b.msgHead];
-
-        shortNameFor(mp.from, m.from);
-        m.ch = mp.channel;
-        m.direct = (nodeDB && mp.to == nodeDB->getNodeNum()) ? 1 : 0;
+        char text[BLP_TEXT];
         if (n > BLP_TEXT - 1)
             n = BLP_TEXT - 1;
-        memcpy(m.text, mp.decoded.payload.bytes, n);
-        m.text[n] = '\0';
+        memcpy(text, mp.decoded.payload.bytes, n);
+        text[n] = '\0';
 
-        b.msgHead = (b.msgHead + 1) % BLP_MAX_MSGS;
-        if (b.numMsgs < BLP_MAX_MSGS)
-            b.numMsgs++;
-        b.rxCount++;
+        char from[BLP_SHORT];
+        shortNameFor(mp.from, from);
+        uint8_t direct = (nodeDB && mp.to == nodeDB->getNodeNum()) ? 1 : 0;
+        pushMsg(mp.from, direct ? mp.from : 0, from, mp.channel, direct, text);
+        g_bleepieBridge.rxCount++;
 
         return ProcessMessage::CONTINUE; // let the normal text module run too
     }
@@ -114,9 +132,22 @@ class BleepieBridgeThread : public concurrency::OSThread
         uint8_t nc = 0;
         uint8_t total = channels.getNumChannels();
         for (uint8_t i = 0; i < total && nc < BLP_MAX_CHANS; i++) {
-            const char *name = channels.getName(i);
+            const meshtastic_Channel &ch = channels.getByIndex(i);
+            if (ch.role == meshtastic_Channel_Role_DISABLED)
+                continue; // getName() names disabled slots too, so filter on role
+
+            // Use the channel's own name if set; otherwise label the primary
+            // "Primary" (matching the Meshtastic apps) rather than the preset name.
+            const char *name;
+            if (ch.settings.name[0])
+                name = ch.settings.name;
+            else if (ch.role == meshtastic_Channel_Role_PRIMARY)
+                name = "Primary";
+            else
+                name = channels.getName(i);
             if (!name || !name[0])
-                continue; // skip disabled/empty channels
+                continue;
+
             b.chans[nc].index = i; // preserve real channel index for directed send
             strncpy(b.chans[nc].name, name, BLP_CHNAME - 1);
             b.chans[nc].name[BLP_CHNAME - 1] = '\0';
@@ -144,6 +175,11 @@ class BleepieBridgeThread : public concurrency::OSThread
                     memcpy(p->decoded.payload.bytes, b.sendText, len);
                     service->sendToMesh(p, RX_SRC_LOCAL, true);
                     b.txCount++;
+                    // reflect our own message into the chat history
+                    if (b.sendIsNode)
+                        pushMsg(0, b.sendDest, "me", 0, 1, b.sendText);
+                    else
+                        pushMsg(0, 0, "me", (uint8_t)b.sendDest, 0, b.sendText);
                 }
             }
             b.sendPending = false;

@@ -15,7 +15,7 @@
 // lock — a torn read is at worst one cosmetically-wrong row for one badge frame.
 
 #define BLP_MAX_NODES 20
-#define BLP_MAX_MSGS  12
+#define BLP_MAX_MSGS  20
 #define BLP_MAX_CHANS 8
 #define BLP_SHORT     6   // 4-char Meshtastic short name + NUL (padded)
 #define BLP_TEXT      64
@@ -28,9 +28,12 @@ struct BlpNode {
 };
 
 struct BlpMsg {
-    char from[BLP_SHORT];
-    uint8_t ch;       // channel index the message arrived on
-    uint8_t direct;   // 1 if addressed directly to us, else 0 (channel broadcast)
+    uint32_t seq;     // monotonic id (for badge-side ordering + dedup)
+    uint32_t fromNum; // sender node num; 0 = us (outgoing)
+    uint32_t peer;    // for DMs: the other party's node num; 0 for channel msgs
+    char from[BLP_SHORT];  // display short name of sender ("me" if outgoing)
+    uint8_t ch;       // channel index (channel broadcasts)
+    uint8_t direct;   // 1 = direct message, 0 = channel broadcast
     char text[BLP_TEXT];
 };
 

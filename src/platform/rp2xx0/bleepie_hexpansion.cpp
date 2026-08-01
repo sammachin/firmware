@@ -158,7 +158,8 @@ static String uartBuf;
 //   status            -> ST <myShort> <nodeCount> <rx> <tx>
 //   nodes             -> ND <hex8> <short> <snr> ... NDE
 //   chans             -> CH <chIndex> <name> ... CHE
-//   msgs              -> MG <direct> <ch> <from> <text> ... MGE   (newest first)
+//   msgs              -> MG <seq> <direct> <ch> <fromNumHex> <peerHex> <from> <text>
+//                        ... MGE   (newest first; fromNum 0 == our own message)
 //   send c<idx> <txt> -> queue a channel broadcast; reply OK/ERR
 //   send n<hex8> <txt>-> queue a direct message to a node; reply OK/ERR
 static void handleBridgeLine(const String &line)
@@ -193,7 +194,9 @@ static void handleBridgeLine(const String &line)
             while (slot < 0)
                 slot += BLP_MAX_MSGS;
             BlpMsg &m = b.msgs[slot];
-            Serial1.printf("MG %u %u %s %s\n", m.direct, m.ch, m.from, m.text);
+            Serial1.printf("MG %lu %u %u %08lx %08lx %s %s\n", (unsigned long)m.seq,
+                           m.direct, m.ch, (unsigned long)m.fromNum,
+                           (unsigned long)m.peer, m.from, m.text);
         }
         Serial1.println("MGE");
 

@@ -1,19 +1,20 @@
 """BleepieMeshtastic controller – Tildagon hexpansion UART app.
 pin[0]=RX(HS_F<-GPIO28) pin[1]=TX(HS_G->GPIO29)
 
-Menu-driven companion for the Meshtastic firmware running on the RP2040 (core0);
-a core1 bridge (bleepie_hexpansion.cpp / bleepie_bridge_thread.cpp) serves this
-app over the emulated hexpansion EEPROM and answers a line protocol:
+Menu-driven companion for the Meshtastic firmware (core0); a core1 bridge serves
+this app over the emulated hexpansion EEPROM and answers a line protocol:
 
   status            -> ST <myShort> <nodeCount> <rx> <tx>
   nodes             -> ND <hex8> <short> <snr> ... NDE
   chans             -> CH <chIndex> <name> ... CHE
-  msgs              -> MG <direct> <ch> <from> <text> ... MGE   (newest first)
+  msgs              -> MG <seq> <direct> <ch> <fromNumHex> <peerHex> <from> <text>
+                       ... MGE   (newest first; fromNum 00000000 == our own msg)
   send c<idx> <txt> -> broadcast on a channel
   send n<hex8> <txt>-> direct message to a node
 
-Menus: Messages / Nodes / Send Message / Status. Composing uses the keyboard via
-TextDialog.
+Menus: Messages / Nodes / Send Message / Status. Messages is a two-level chat:
+a conversation list (by channel or DM peer) then a time-ordered thread with a
+distinct colour per sender and reply via the keyboard (TextDialog).
 """
 
 import app
@@ -27,6 +28,12 @@ from machine import UART
 _TX = 1
 _RX = 0
 _MENU = ["Messages", "Nodes", "Send Message", "Status"]
+_ME_HEX = "00000000"
+# distinct colours cycled per remote sender; our own messages use _ME
+_PAL = [(1.0, 0.55, 0.55), (0.55, 1.0, 0.6), (0.6, 0.75, 1.0),
+        (1.0, 0.9, 0.4), (1.0, 0.6, 1.0), (0.5, 1.0, 1.0), (1.0, 0.75, 0.5)]
+_ME = (0.35, 1.0, 0.7)
+_MSG_CAP = 80
 
 
 class MeshtasticApp(app.App):
@@ -65,19 +72,20 @@ class MeshtasticApp(app.App):
         self.view = "menu"
         self.idx = 0
         self.dialog = None
-        self.readmsg = None       # message dict being viewed
+        self.conv = None          # ("c", ch) or ("d", peerHex) when in "chat"
+        self.chat_off = 0         # scrollback offset (0 = newest at bottom)
         self.send_dest = None     # {"kind":"c"/"n", "id":..., "label":...}
+        self._after_send = "menu"
         self.toast = ""
         self.toast_t = 0
 
-        # Live data from the firmware
+        # Live data
         self.status = {"name": "----", "nodes": 0, "rx": 0, "tx": 0}
-        self.nodes = []           # [{"num","short","snr"}]
-        self.chans = []           # [{"idx","name"}]
-        self.msgs = []            # [{"direct","ch","from","text"}] newest first
+        self.nodes = []
+        self.chans = []
+        self.store = {}           # seq -> msg dict (local accumulated history)
         self._t_nodes = []
         self._t_chans = []
-        self._t_msgs = []
 
         eventbus.on(RequestForegroundPushEvent, self._on_fg, self)
         self.overlays = []
@@ -109,7 +117,7 @@ class MeshtasticApp(app.App):
     def _parse(self, line):
         if not line:
             return
-        p = line.split(" ", 4)
+        p = line.split(" ", 7)
         tag = p[0]
         if tag == "ST" and len(p) >= 5:
             self.status = {"name": p[1], "nodes": self._int(p[2]),
@@ -124,12 +132,16 @@ class MeshtasticApp(app.App):
         elif tag == "CHE":
             self.chans = self._t_chans
             self._t_chans = []
-        elif tag == "MG" and len(p) >= 4:
-            self._t_msgs.append({"direct": self._int(p[1]), "ch": self._int(p[2]),
-                                 "from": p[3], "text": p[4] if len(p) >= 5 else ""})
-        elif tag == "MGE":
-            self.msgs = self._t_msgs
-            self._t_msgs = []
+        elif tag == "MG" and len(p) >= 7:
+            seq = self._int(p[1])
+            if seq and seq not in self.store:
+                self.store[seq] = {
+                    "seq": seq, "direct": self._int(p[2]), "ch": self._int(p[3]),
+                    "fromNum": p[4], "peer": p[5], "from": p[6],
+                    "text": p[7] if len(p) >= 8 else ""}
+                if len(self.store) > _MSG_CAP:
+                    for k in sorted(self.store)[:len(self.store) - _MSG_CAP]:
+                        del self.store[k]
         elif tag == "OK":
             self._set_toast("Sent")
         elif tag == "ERR":
@@ -152,13 +164,65 @@ class MeshtasticApp(app.App):
                 return c["name"]
         return "ch%d" % idx
 
+    def _short_for(self, peer_hex):
+        for nd in self.nodes:
+            if nd["num"].lower() == peer_hex.lower():
+                return nd["short"]
+        for m in self.store.values():
+            if m["fromNum"].lower() == peer_hex.lower() and m["from"] != "me":
+                return m["from"]
+        return peer_hex[-4:]
+
+    # ---- conversations ----
+    def _conversations(self):
+        convs = {}
+        for m in self.store.values():
+            if m["direct"]:
+                key = ("d", m["peer"])
+                label = "@" + self._short_for(m["peer"])
+            else:
+                key = ("c", m["ch"])
+                label = "#" + self._chan_name(m["ch"])
+            c = convs.get(key)
+            if c is None:
+                c = {"key": key, "label": label, "last": 0, "text": "", "n": 0}
+                convs[key] = c
+            c["n"] += 1
+            if m["seq"] >= c["last"]:
+                c["last"] = m["seq"]
+                c["text"] = m["text"]
+                c["label"] = label
+        return sorted(convs.values(), key=lambda c: c["last"], reverse=True)
+
+    def _conv_msgs(self, conv):
+        kind, ref = conv
+        out = []
+        for m in self.store.values():
+            if kind == "c" and not m["direct"] and m["ch"] == ref:
+                out.append(m)
+            elif kind == "d" and m["direct"] and m["peer"] == ref:
+                out.append(m)
+        out.sort(key=lambda m: m["seq"])
+        return out
+
+    @staticmethod
+    def _sender_color(m):
+        if m["fromNum"] == _ME_HEX:
+            return _ME
+        try:
+            h = int(m["fromNum"], 16)
+        except Exception:
+            h = sum(ord(ch) for ch in m["from"])
+        return _PAL[h % len(_PAL)]
+
     async def background_task(self):
         while True:
             self._cmd("status")
             v = self.view
-            if v in ("msgs", "read"):
+            if v in ("msgs", "chat"):
                 self._cmd("msgs")
                 self._cmd("chans")
+                self._cmd("nodes")
             elif v == "nodes":
                 self._cmd("nodes")
             elif v == "send":
@@ -187,7 +251,7 @@ class MeshtasticApp(app.App):
         if v == "menu":
             return len(_MENU)
         if v == "msgs":
-            return len(self.msgs)
+            return len(self._conversations())
         if v == "nodes":
             return len(self.nodes)
         if v == "send":
@@ -195,10 +259,12 @@ class MeshtasticApp(app.App):
         return 0
 
     def _nav(self, d):
-        n = self._list_len()
-        if n <= 0:
+        if self.view == "chat":
+            self.chat_off = max(0, self.chat_off - d)  # UP scrolls back
             return
-        self.idx = max(0, min(self.idx + d, n - 1))
+        n = self._list_len()
+        if n > 0:
+            self.idx = max(0, min(self.idx + d, n - 1))
 
     def _back(self):
         v = self.view
@@ -206,7 +272,7 @@ class MeshtasticApp(app.App):
             eventbus.remove(ButtonDownEvent, self._on_btn, self)
             self._active = False
             self.minimise()
-        elif v == "read":
+        elif v == "chat":
             self.view = "msgs"
         else:
             self.view = "menu"
@@ -218,26 +284,39 @@ class MeshtasticApp(app.App):
             self.view = ["msgs", "nodes", "send", "status"][self.idx]
             self.idx = 0
         elif v == "msgs":
-            if 0 <= self.idx < len(self.msgs):
-                self.readmsg = self.msgs[self.idx]
-                self.view = "read"
+            convs = self._conversations()
+            if 0 <= self.idx < len(convs):
+                self.conv = convs[self.idx]["key"]
+                self.chat_off = 0
+                self.view = "chat"
+        elif v == "chat":
+            self._reply()
         elif v == "nodes":
             if 0 <= self.idx < len(self.nodes):
                 nd = self.nodes[self.idx]
                 self.send_dest = {"kind": "n", "id": nd["num"], "label": "@" + nd["short"]}
-                self._compose()
+                self._compose("menu")
         elif v == "send":
             nc = len(self.chans)
             if self.idx < nc:
                 c = self.chans[self.idx]
                 self.send_dest = {"kind": "c", "id": c["idx"], "label": "#" + c["name"]}
-            else:
+            elif self.idx - nc < len(self.nodes):
                 nd = self.nodes[self.idx - nc]
                 self.send_dest = {"kind": "n", "id": nd["num"], "label": "@" + nd["short"]}
-            self._compose()
+            self._compose("menu")
+
+    def _reply(self):
+        kind, ref = self.conv
+        if kind == "c":
+            self.send_dest = {"kind": "c", "id": ref, "label": "#" + self._chan_name(ref)}
+        else:
+            self.send_dest = {"kind": "n", "id": ref, "label": "@" + self._short_for(ref)}
+        self._compose("chat")
 
     # ---- compose ----
-    def _compose(self):
+    def _compose(self, after):
+        self._after_send = after
         self.dialog = TextDialog("To %s:" % self.send_dest["label"], self,
                                  on_complete=self._send_done,
                                  on_cancel=self._send_cancel)
@@ -251,8 +330,11 @@ class MeshtasticApp(app.App):
             pfx = ("c%d" % d["id"]) if d["kind"] == "c" else ("n%s" % d["id"])
             self._cmd("send %s %s" % (pfx, text))
             self._set_toast("Sending...")
-        self.view = "menu"
-        self.idx = 0
+        self.view = self._after_send
+        if self.view == "chat":
+            self.chat_off = 0
+        else:
+            self.idx = 0
 
     def _send_cancel(self):
         self.dialog._cleanup()
@@ -275,12 +357,12 @@ class MeshtasticApp(app.App):
         clear_background(ctx)
         ctx.text_align = ctx.CENTER
         ctx.font_size = 20
-        ctx.rgb(0.2, 0.8, 0.9).move_to(0, -88).text("Meshtastic")
+        ctx.rgb(0.2, 0.8, 0.9).move_to(0, -92).text("Meshtastic")
         ctx.font_size = 11
-        ctx.rgb(0.5, 0.5, 0.5).move_to(0, -70).text(
+        ctx.rgb(0.5, 0.5, 0.5).move_to(0, -75).text(
             "%s  %d nodes" % (self.status["name"], self.status["nodes"]))
 
-        fn = {"menu": self._d_menu, "msgs": self._d_msgs, "read": self._d_read,
+        fn = {"menu": self._d_menu, "msgs": self._d_msgs, "chat": self._d_chat,
               "nodes": self._d_nodes, "send": self._d_send,
               "status": self._d_status}.get(self.view)
         if fn:
@@ -288,10 +370,10 @@ class MeshtasticApp(app.App):
 
         if not self.uart:
             ctx.font_size = 11
-            ctx.rgb(1, 0, 0).move_to(0, 92).text("No UART")
+            ctx.rgb(1, 0, 0).move_to(0, 95).text("No UART")
         elif self.toast_t > 0 and self.toast:
             ctx.font_size = 12
-            ctx.rgb(0, 1, 0.3).move_to(0, 92).text(self.toast[:32])
+            ctx.rgb(0, 1, 0.3).move_to(0, 95).text(self.toast[:32])
 
         if self.dialog:
             self.dialog.draw(ctx)
@@ -308,11 +390,11 @@ class MeshtasticApp(app.App):
         start = max(0, self.idx - 2)
         ctx.font_size = 15
         ctx.text_align = ctx.LEFT
-        y = -45
+        y = -48
         for i in range(start, min(n, start + 6)):
             sel = (i == self.idx)
             ctx.rgb(1, 1, 0) if sel else ctx.rgb(0.65, 0.65, 0.65)
-            ctx.move_to(-95, y).text((("> " if sel else "  ") + labels[i])[:22])
+            ctx.move_to(-96, y).text((("> " if sel else "  ") + labels[i])[:23])
             y += 20
         ctx.text_align = ctx.CENTER
 
@@ -328,46 +410,54 @@ class MeshtasticApp(app.App):
                 ctx.rgb(0.65, 0.65, 0.65).move_to(0, y).text(label)
 
     def _d_msgs(self, ctx):
+        convs = self._conversations()
         labels = []
-        for m in self.msgs:
-            tag = "DM" if m["direct"] else self._chan_name(m["ch"])
-            labels.append("%s[%s] %s" % (m["from"], tag, m["text"]))
-        self._draw_list(ctx, labels, "No messages")
+        for c in convs:
+            snippet = c["text"][:12]
+            labels.append("%-9s %s" % (c["label"][:9], snippet))
+        self._draw_list(ctx, labels, "No conversations")
         ctx.font_size = 10
-        ctx.rgb(0.35, 0.35, 0.35).move_to(0, 78).text("[OK] read  [BACK] menu")
+        ctx.rgb(0.35, 0.35, 0.35).move_to(0, 80).text("[OK] open  [BACK] menu")
 
-    def _d_read(self, ctx):
-        m = self.readmsg or {}
-        tag = "DM" if m.get("direct") else self._chan_name(m.get("ch", 0))
-        ctx.font_size = 14
-        ctx.rgb(0.2, 0.8, 1.0).move_to(0, -45).text("%s  [%s]" % (m.get("from", "?"), tag))
-        ctx.font_size = 15
-        ctx.rgb(1, 1, 1)
-        # wrap the text across lines
-        text = m.get("text", "")
-        y = -18
-        line = ""
-        for word in text.split(" "):
-            if len(line) + len(word) + 1 > 22:
-                ctx.move_to(0, y).text(line)
-                y += 20
-                line = word
-            else:
-                line = (line + " " + word) if line else word
-        if line:
-            ctx.move_to(0, y).text(line)
+    def _d_chat(self, ctx):
+        kind, ref = self.conv
+        title = ("#" + self._chan_name(ref)) if kind == "c" else ("@" + self._short_for(ref))
+        ctx.font_size = 13
+        ctx.rgb(0.2, 0.8, 1.0).move_to(0, -58).text(title[:22])
+
+        msgs = self._conv_msgs(self.conv)
+        # show the window of lines ending at (newest - chat_off)
+        rows = 6
+        end = len(msgs) - self.chat_off
+        if end < 1:
+            end = min(len(msgs), 1)
+        start = max(0, end - rows)
+        ctx.font_size = 13
+        ctx.text_align = ctx.LEFT
+        y = -38
+        for m in msgs[start:end]:
+            r, g, b = self._sender_color(m)
+            who = "me" if m["fromNum"] == _ME_HEX else m["from"]
+            ctx.rgb(r, g, b)
+            ctx.move_to(-96, y).text(("%s: %s" % (who, m["text"]))[:24])
+            y += 18
+        ctx.text_align = ctx.CENTER
+        if not msgs:
+            ctx.rgb(0.5, 0.5, 0.5).move_to(0, 0).text("No messages yet")
+        ctx.font_size = 10
+        ctx.rgb(0.35, 0.35, 0.35).move_to(0, 82).text("[OK] reply  UP/DN scroll")
 
     def _d_nodes(self, ctx):
         labels = ["%-5s %ddB" % (nd["short"], nd["snr"]) for nd in self.nodes]
         self._draw_list(ctx, labels, "No nodes")
         ctx.font_size = 10
-        ctx.rgb(0.35, 0.35, 0.35).move_to(0, 78).text("[OK] message node")
+        ctx.rgb(0.35, 0.35, 0.35).move_to(0, 80).text("[OK] message node")
 
     def _d_send(self, ctx):
         labels = ["#" + c["name"] for c in self.chans] + ["@" + nd["short"] for nd in self.nodes]
         self._draw_list(ctx, labels, "No destinations")
         ctx.font_size = 10
-        ctx.rgb(0.35, 0.35, 0.35).move_to(0, 78).text("[OK] compose")
+        ctx.rgb(0.35, 0.35, 0.35).move_to(0, 80).text("[OK] compose")
 
     def _d_status(self, ctx):
         s = self.status
